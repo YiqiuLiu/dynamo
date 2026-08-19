@@ -840,7 +840,7 @@ async fn handler_completions(
 #[tracing::instrument(skip_all)]
 async fn completions(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
 ) -> Result<Response, ErrorResponse> {
     use crate::protocols::openai::completions::get_prompt_batch_size;
@@ -851,7 +851,9 @@ async fn completions(
     // Validate stream_options is only used when streaming (NVBug 5662680)
     validate_completion_stream_options(&request)?;
 
-    validate_completion_fields_generic(&request)?;
+    // `_generic` runs `normalize_return_token_ids` before `validate`, so it
+    // needs `&mut` — `request` is now `mut` above.
+    validate_completion_fields_generic(&mut request)?;
 
     // Detect batch prompts
     let batch_size = get_prompt_batch_size(&request.inner.prompt);
@@ -2821,8 +2823,9 @@ async fn chat_completions(
         return Err(err_response);
     }
 
-    // Handle Rest of Validation Errors
-    if let Err(err_response) = validate_chat_completion_fields_generic(&request) {
+    // Handle Rest of Validation Errors. `_generic` runs
+    // `normalize_return_token_ids` before `validate`, so `&mut` is required.
+    if let Err(err_response) = validate_chat_completion_fields_generic(&mut request) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         return Err(err_response);
     }
@@ -3170,9 +3173,21 @@ pub fn validate_chat_completion_stream_options(
 ///
 /// This function calls the `validate` method implemented for `NvCreateChatCompletionRequest`.
 /// If validation fails, it maps the error into an OpenAI-compatible error response.
+///
+/// Takes `&mut` so it can run request-shape normalization (currently:
+/// `normalize_return_token_ids`, which folds the top-level `return_token_ids`
+/// alias into `nvext.extra_fields`) BEFORE `validate` runs, because
+/// `validate_completion_token_ids_single_choice` inspects
+/// `nvext.extra_fields`.
 pub fn validate_chat_completion_fields_generic(
-    request: &NvCreateChatCompletionRequest,
+    request: &mut NvCreateChatCompletionRequest,
 ) -> Result<(), ErrorResponse> {
+    request.normalize_return_token_ids().map_err(|e| {
+        ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: VALIDATION_PREFIX.to_string() + &e.to_string(),
+        })
+    })?;
     request.validate().map_err(|e| {
         ErrorMessage::from_http_error(HttpError {
             code: 400,
@@ -3201,9 +3216,19 @@ pub fn validate_completion_stream_options(
 ///
 /// This function calls the `validate` method implemented for `NvCreateCompletionRequest`.
 /// If validation fails, it maps the error into an OpenAI-compatible error response.
+///
+/// Takes `&mut` so `normalize_return_token_ids` (folding the top-level alias
+/// into `nvext.extra_fields`) runs before `validate`; see
+/// [`validate_chat_completion_fields_generic`] for the same rationale.
 pub fn validate_completion_fields_generic(
-    request: &NvCreateCompletionRequest,
+    request: &mut NvCreateCompletionRequest,
 ) -> Result<(), ErrorResponse> {
+    request.normalize_return_token_ids().map_err(|e| {
+        ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: VALIDATION_PREFIX.to_string() + &e.to_string(),
+        })
+    })?;
     request.validate().map_err(|e| {
         ErrorMessage::from_http_error(HttpError {
             code: 400,
@@ -3412,6 +3437,17 @@ async fn responses(
     let responses_ctx = unified_request.responses_context().cloned();
     let mut chat_request = unified_request.into_inner();
     if let Err(err_response) = normalize_chat_reasoning_template_args(&mut chat_request) {
+        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        return Err(err_response);
+    }
+    // Also fold `return_token_ids: true` -> nvext.extra_fields BEFORE validate,
+    // so the Responses-endpoint pipeline behaves the same as
+    // `validate_chat_completion_fields_generic`.
+    if let Err(e) = chat_request.normalize_return_token_ids() {
+        let err_response = ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: VALIDATION_PREFIX.to_string() + &e.to_string(),
+        });
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         return Err(err_response);
     }
@@ -5992,6 +6028,7 @@ mod tests {
             thinking: None,
             media_io_kwargs: None,
             return_tokens_as_token_ids: None,
+            return_token_ids: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_required_fields(&request);
@@ -6026,6 +6063,7 @@ mod tests {
             thinking: None,
             media_io_kwargs: None,
             return_tokens_as_token_ids: None,
+            return_token_ids: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_required_fields(&request);
@@ -6076,7 +6114,7 @@ mod tests {
     // "logit_bias": { "invalid_token": "not_a_number" }, : Partial Validation is already there
     fn test_bad_base_request_for_completion() {
         // Frequency Penalty: Should be a float between -2.0 and 2.0
-        let request = NvCreateCompletionRequest {
+        let mut request = NvCreateCompletionRequest {
             inner: CreateCompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "Hello".into(),
@@ -6087,10 +6125,11 @@ mod tests {
             nvext: None,
             metadata: None,
             return_tokens_as_token_ids: None,
+            return_token_ids: None,
             unsupported_fields: Default::default(),
         };
 
-        let result = validate_completion_fields_generic(&request);
+        let result = validate_completion_fields_generic(&mut request);
         assert!(result.is_err());
         if let Err(error_response) = result {
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
@@ -6101,7 +6140,7 @@ mod tests {
         }
 
         // Presence Penalty: Should be a float between -2.0 and 2.0
-        let request = NvCreateCompletionRequest {
+        let mut request = NvCreateCompletionRequest {
             inner: CreateCompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "Hello".into(),
@@ -6112,9 +6151,10 @@ mod tests {
             nvext: None,
             metadata: None,
             return_tokens_as_token_ids: None,
+            return_token_ids: None,
             unsupported_fields: Default::default(),
         };
-        let result = validate_completion_fields_generic(&request);
+        let result = validate_completion_fields_generic(&mut request);
         assert!(result.is_err());
         if let Err(error_response) = result {
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
@@ -6125,7 +6165,7 @@ mod tests {
         }
 
         // Temperature: Should be a float between 0.0 and 2.0
-        let request = NvCreateCompletionRequest {
+        let mut request = NvCreateCompletionRequest {
             inner: CreateCompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "Hello".into(),
@@ -6136,9 +6176,10 @@ mod tests {
             nvext: None,
             metadata: None,
             return_tokens_as_token_ids: None,
+            return_token_ids: None,
             unsupported_fields: Default::default(),
         };
-        let result = validate_completion_fields_generic(&request);
+        let result = validate_completion_fields_generic(&mut request);
         assert!(result.is_err());
         if let Err(error_response) = result {
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
@@ -6149,7 +6190,7 @@ mod tests {
         }
 
         // Top P: Should be a float between 0.0 and 1.0
-        let request = NvCreateCompletionRequest {
+        let mut request = NvCreateCompletionRequest {
             inner: CreateCompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "Hello".into(),
@@ -6160,9 +6201,10 @@ mod tests {
             nvext: None,
             metadata: None,
             return_tokens_as_token_ids: None,
+            return_token_ids: None,
             unsupported_fields: Default::default(),
         };
-        let result = validate_completion_fields_generic(&request);
+        let result = validate_completion_fields_generic(&mut request);
         assert!(result.is_err());
         if let Err(error_response) = result {
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
@@ -6173,7 +6215,7 @@ mod tests {
         }
 
         // Repetition Penalty: Should be a float between 0.0 and 2.0
-        let request = NvCreateCompletionRequest {
+        let mut request = NvCreateCompletionRequest {
             inner: CreateCompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "Hello".into(),
@@ -6186,9 +6228,10 @@ mod tests {
             nvext: None,
             metadata: None,
             return_tokens_as_token_ids: None,
+            return_token_ids: None,
             unsupported_fields: Default::default(),
         };
-        let result = validate_completion_fields_generic(&request);
+        let result = validate_completion_fields_generic(&mut request);
         assert!(result.is_err());
         if let Err(error_response) = result {
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
@@ -6199,7 +6242,7 @@ mod tests {
         }
 
         // Logprobs: Should be a positive integer between 0 and 5
-        let request = NvCreateCompletionRequest {
+        let mut request = NvCreateCompletionRequest {
             inner: CreateCompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "Hello".into(),
@@ -6210,9 +6253,10 @@ mod tests {
             nvext: None,
             metadata: None,
             return_tokens_as_token_ids: None,
+            return_token_ids: None,
             unsupported_fields: Default::default(),
         };
-        let result = validate_completion_fields_generic(&request);
+        let result = validate_completion_fields_generic(&mut request);
         assert!(result.is_err());
         if let Err(error_response) = result {
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
@@ -6228,7 +6272,7 @@ mod tests {
         use serde_json::json;
 
         // Test metadata field with nested object
-        let request = NvCreateCompletionRequest {
+        let mut request = NvCreateCompletionRequest {
             inner: CreateCompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "Hello".into(),
@@ -6242,10 +6286,11 @@ mod tests {
             })
             .into(),
             return_tokens_as_token_ids: None,
+            return_token_ids: None,
             unsupported_fields: Default::default(),
         };
 
-        let result = validate_completion_fields_generic(&request);
+        let result = validate_completion_fields_generic(&mut request);
         assert!(result.is_ok());
 
         // Verify metadata is accessible
@@ -6256,7 +6301,7 @@ mod tests {
     #[test]
     fn test_bad_base_request_for_chatcompletion() {
         // Frequency Penalty: Should be a float between -2.0 and 2.0
-        let request = NvCreateChatCompletionRequest {
+        let mut request = NvCreateChatCompletionRequest {
             inner: CreateChatCompletionRequest {
                 model: "test-model".to_string(),
                 messages: vec![ChatCompletionRequestMessage::User(
@@ -6274,10 +6319,11 @@ mod tests {
             thinking: None,
             media_io_kwargs: None,
             return_tokens_as_token_ids: None,
+            return_token_ids: None,
             unsupported_fields: Default::default(),
         };
 
-        let result = validate_chat_completion_fields_generic(&request);
+        let result = validate_chat_completion_fields_generic(&mut request);
         assert!(result.is_err());
         if let Err(error_response) = result {
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
@@ -6288,7 +6334,7 @@ mod tests {
         }
 
         // Presence Penalty: Should be a float between -2.0 and 2.0
-        let request = NvCreateChatCompletionRequest {
+        let mut request = NvCreateChatCompletionRequest {
             inner: CreateChatCompletionRequest {
                 model: "test-model".to_string(),
                 messages: vec![ChatCompletionRequestMessage::User(
@@ -6306,9 +6352,10 @@ mod tests {
             thinking: None,
             media_io_kwargs: None,
             return_tokens_as_token_ids: None,
+            return_token_ids: None,
             unsupported_fields: Default::default(),
         };
-        let result = validate_chat_completion_fields_generic(&request);
+        let result = validate_chat_completion_fields_generic(&mut request);
         assert!(result.is_err());
         if let Err(error_response) = result {
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
@@ -6319,7 +6366,7 @@ mod tests {
         }
 
         // Temperature: Should be a float between 0.0 and 2.0
-        let request = NvCreateChatCompletionRequest {
+        let mut request = NvCreateChatCompletionRequest {
             inner: CreateChatCompletionRequest {
                 model: "test-model".to_string(),
                 messages: vec![ChatCompletionRequestMessage::User(
@@ -6337,9 +6384,10 @@ mod tests {
             thinking: None,
             media_io_kwargs: None,
             return_tokens_as_token_ids: None,
+            return_token_ids: None,
             unsupported_fields: Default::default(),
         };
-        let result = validate_chat_completion_fields_generic(&request);
+        let result = validate_chat_completion_fields_generic(&mut request);
         assert!(result.is_err());
         if let Err(error_response) = result {
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
@@ -6350,7 +6398,7 @@ mod tests {
         }
 
         // Top P: Should be a float between 0.0 and 1.0
-        let request = NvCreateChatCompletionRequest {
+        let mut request = NvCreateChatCompletionRequest {
             inner: CreateChatCompletionRequest {
                 model: "test-model".to_string(),
                 messages: vec![ChatCompletionRequestMessage::User(
@@ -6368,9 +6416,10 @@ mod tests {
             thinking: None,
             media_io_kwargs: None,
             return_tokens_as_token_ids: None,
+            return_token_ids: None,
             unsupported_fields: Default::default(),
         };
-        let result = validate_chat_completion_fields_generic(&request);
+        let result = validate_chat_completion_fields_generic(&mut request);
         assert!(result.is_err());
         if let Err(error_response) = result {
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
@@ -6381,7 +6430,7 @@ mod tests {
         }
 
         // Repetition Penalty: Should be a float between 0.0 and 2.0
-        let request = NvCreateChatCompletionRequest {
+        let mut request = NvCreateChatCompletionRequest {
             inner: CreateChatCompletionRequest {
                 model: "test-model".to_string(),
                 messages: vec![ChatCompletionRequestMessage::User(
@@ -6401,9 +6450,10 @@ mod tests {
             thinking: None,
             media_io_kwargs: None,
             return_tokens_as_token_ids: None,
+            return_token_ids: None,
             unsupported_fields: Default::default(),
         };
-        let result = validate_chat_completion_fields_generic(&request);
+        let result = validate_chat_completion_fields_generic(&mut request);
         assert!(result.is_err());
         if let Err(error_response) = result {
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
@@ -6414,7 +6464,7 @@ mod tests {
         }
 
         // Top Logprobs: Should be a positive integer between 0 and 20
-        let request = NvCreateChatCompletionRequest {
+        let mut request = NvCreateChatCompletionRequest {
             inner: CreateChatCompletionRequest {
                 model: "test-model".to_string(),
                 messages: vec![ChatCompletionRequestMessage::User(
@@ -6432,9 +6482,10 @@ mod tests {
             thinking: None,
             media_io_kwargs: None,
             return_tokens_as_token_ids: None,
+            return_token_ids: None,
             unsupported_fields: Default::default(),
         };
-        let result = validate_chat_completion_fields_generic(&request);
+        let result = validate_chat_completion_fields_generic(&mut request);
         assert!(result.is_err());
         if let Err(error_response) = result {
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
@@ -6456,7 +6507,7 @@ mod tests {
             "chat_template": "custom"
         }"#;
 
-        let request: NvCreateChatCompletionRequest = serde_json::from_str(json).unwrap();
+        let mut request: NvCreateChatCompletionRequest = serde_json::from_str(json).unwrap();
 
         // Verify all unsupported fields were captured
         assert!(
@@ -6467,7 +6518,7 @@ mod tests {
         assert!(request.unsupported_fields.contains_key("documents"));
         assert!(request.unsupported_fields.contains_key("chat_template"));
 
-        let result = validate_chat_completion_fields_generic(&request);
+        let result = validate_chat_completion_fields_generic(&mut request);
         assert!(result.is_err());
         if let Err(error_response) = result {
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
@@ -6490,7 +6541,7 @@ mod tests {
             "response_format": {"type": "json_object"}
         }"#;
 
-        let request: NvCreateCompletionRequest = serde_json::from_str(json).unwrap();
+        let mut request: NvCreateCompletionRequest = serde_json::from_str(json).unwrap();
 
         // Verify both unsupported fields were captured
         assert!(
@@ -6500,7 +6551,7 @@ mod tests {
         );
         assert!(request.unsupported_fields.contains_key("response_format"));
 
-        let result = validate_completion_fields_generic(&request);
+        let result = validate_completion_fields_generic(&mut request);
         assert!(result.is_err());
         if let Err(error_response) = result {
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
@@ -6939,6 +6990,8 @@ mod tests {
                     service_tier: None,
                     usage: None,
                 },
+                prompt_token_ids: None,
+                kv_transfer_params: None,
                 nvext: None,
                 llm_metrics: None,
             }),
@@ -6979,6 +7032,8 @@ mod tests {
                     service_tier: None,
                     usage: None,
                 },
+                prompt_token_ids: None,
+                kv_transfer_params: None,
                 nvext: None,
                 llm_metrics: None,
             }),
@@ -7376,6 +7431,8 @@ mod tests {
                 usage: None,
                 service_tier: None,
             },
+            prompt_token_ids: None,
+            kv_transfer_params: None,
             nvext: None,
             llm_metrics: None,
         };
@@ -8010,6 +8067,8 @@ mod tests {
                 usage,
                 service_tier: None,
             },
+            prompt_token_ids: None,
+            kv_transfer_params: None,
             nvext: None,
             llm_metrics: None,
         }
@@ -8322,6 +8381,8 @@ mod tests {
                 object: "text_completion".to_string(),
                 usage,
             },
+            prompt_token_ids: None,
+            kv_transfer_params: None,
             nvext: None,
         }
     }
@@ -8378,6 +8439,8 @@ mod tests {
                 object: "text_completion".to_string(),
                 usage: Some(usage),
             },
+            prompt_token_ids: None,
+            kv_transfer_params: None,
             nvext: None,
         }
     }
