@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 
+use crate::protocols::common::metrics::LLMMetricAnnotation;
 use crate::protocols::openai::ParsingOptions;
 use crate::protocols::openai::chat_completions::{
     DeltaAggregator, NvCreateChatCompletionResponse, NvCreateChatCompletionStreamResponse,
@@ -124,13 +125,18 @@ where
 
     let single_chunk_stream = async move {
         let chunks: Vec<_> = stream.collect().await;
+        // Folding discards the per-chunk `llm_metrics` the frontend collector reads
+        // to observe TTFT/ITL/ISL/OSL and output_tokens_total, so roll them up here
+        // and re-attach below. Without this, capture silently zeroes every
+        // token-derived frontend metric for non-streaming requests.
+        let rolled_metrics = roll_up_llm_metrics(&chunks);
         let chunks_stream = futures::stream::iter(chunks);
         let parsing_options = ParsingOptions::default();
 
         match DeltaAggregator::apply(chunks_stream, parsing_options).await {
             Ok(final_resp) => {
                 let _ = tx.send(final_resp.clone());
-                final_response_to_one_chunk_stream(final_resp)
+                final_response_to_one_chunk_stream_with_metrics(final_resp, rolled_metrics)
             }
             Err(e) => {
                 tracing::warn!("fold aggregation failed: {e}");
@@ -152,7 +158,7 @@ where
                     },
                     nvext: None,
                 };
-                final_response_to_one_chunk_stream(fallback)
+                final_response_to_one_chunk_stream_with_metrics(fallback, rolled_metrics)
             }
         }
     };
@@ -175,10 +181,73 @@ where
     )
 }
 
+/// Sum the per-chunk `llm_metrics` of a folded response into one annotation.
+///
+/// `chunk_tokens` becomes the whole response's output-token count, since the fold
+/// emits exactly one chunk downstream. Request-scoped fields (input/cached tokens,
+/// media counts, worker identity) are taken from the last chunk that carried them,
+/// matching how the streaming path leaves them on the final chunk.
+fn roll_up_llm_metrics(
+    chunks: &[Annotated<NvCreateChatCompletionStreamResponse>],
+) -> Option<LLMMetricAnnotation> {
+    let mut rolled: Option<LLMMetricAnnotation> = None;
+    for m in chunks
+        .iter()
+        .filter_map(|c| c.data.as_ref())
+        .filter_map(|d| d.llm_metrics.as_ref())
+    {
+        match rolled.as_mut() {
+            None => rolled = Some(m.clone()),
+            Some(acc) => {
+                acc.chunk_tokens += m.chunk_tokens;
+                // Already cumulative per chunk (`cumulative_output_tokens` in the
+                // preprocessor), so take the latest rather than summing.
+                acc.output_tokens = m.output_tokens;
+                acc.input_tokens = m.input_tokens;
+                acc.cached_tokens = m.cached_tokens.or(acc.cached_tokens);
+                acc.image_count = m.image_count.max(acc.image_count);
+                acc.video_count = m.video_count.max(acc.video_count);
+                acc.audio_count = m.audio_count.max(acc.audio_count);
+                acc.image_tokens = m.image_tokens.or(acc.image_tokens);
+                acc.prefill_worker_id = m.prefill_worker_id.or(acc.prefill_worker_id);
+                acc.prefill_dp_rank = m.prefill_dp_rank.or(acc.prefill_dp_rank);
+                acc.prefill_worker_type = m
+                    .prefill_worker_type
+                    .clone()
+                    .or_else(|| acc.prefill_worker_type.clone());
+                acc.decode_worker_id = m.decode_worker_id.or(acc.decode_worker_id);
+                acc.decode_dp_rank = m.decode_dp_rank.or(acc.decode_dp_rank);
+                acc.decode_worker_type = m
+                    .decode_worker_type
+                    .clone()
+                    .or_else(|| acc.decode_worker_type.clone());
+                // The collector assigns rather than accumulates these, so each chunk
+                // already carries a request-cumulative total: take the latest.
+                acc.tokenize_latency = m.tokenize_latency.or(acc.tokenize_latency);
+                acc.detokenize_total_latency =
+                    m.detokenize_total_latency.or(acc.detokenize_total_latency);
+                acc.detokenize_count = m.detokenize_count.or(acc.detokenize_count);
+            }
+        }
+    }
+    rolled
+}
+
 /// Convert a final (non-streaming) response into a single "final chunk" stream.
 /// Put the entire final text/tool-calls into `delta` so downstream aggregate is a no-op.
 pub fn final_response_to_one_chunk_stream(
     resp: NvCreateChatCompletionResponse,
+) -> std::pin::Pin<
+    Box<dyn futures::Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>,
+> {
+    final_response_to_one_chunk_stream_with_metrics(resp, None)
+}
+
+/// As [`final_response_to_one_chunk_stream`], carrying rolled-up `llm_metrics` so the
+/// frontend metrics collector still sees the response's token counts.
+pub fn final_response_to_one_chunk_stream_with_metrics(
+    resp: NvCreateChatCompletionResponse,
+    llm_metrics: Option<LLMMetricAnnotation>,
 ) -> std::pin::Pin<
     Box<dyn futures::Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>,
 > {
@@ -243,7 +312,7 @@ pub fn final_response_to_one_chunk_stream(
             usage: resp.inner.usage.clone(),
         },
         nvext: resp.nvext.clone(),
-        llm_metrics: None,
+        llm_metrics,
     };
 
     let annotated = Annotated {
@@ -705,5 +774,65 @@ mod tests {
 
         assert!(resp1.is_none());
         assert!(resp2.is_none());
+    }
+
+    /// A chunk carrying `llm_metrics`, as the preprocessor emits during generation.
+    fn chunk_with_metrics(
+        content: &str,
+        chunk_tokens: usize,
+        output_tokens: usize,
+        input_tokens: usize,
+    ) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        let mut c = create_mock_chunk(content.to_string(), 0);
+        c.data.as_mut().unwrap().llm_metrics = Some(LLMMetricAnnotation {
+            input_tokens,
+            output_tokens,
+            chunk_tokens,
+            ..Default::default()
+        });
+        c
+    }
+
+    /// Regression: folding a non-streaming response used to drop `llm_metrics`
+    /// entirely, so the frontend collector saw chunk_tokens == 0 and skipped
+    /// TTFT / ITL / ISL / OSL and output_tokens_total for every captured request.
+    #[tokio::test]
+    async fn test_fold_preserves_llm_metrics_for_frontend_collector() {
+        let chunks = vec![
+            chunk_with_metrics("Hello", 2, 2, 7),
+            chunk_with_metrics(" world", 3, 5, 7),
+        ];
+        let (stream, _future) = fold_aggregate_with_future(stream::iter(chunks));
+        let out: Vec<_> = stream.collect().await;
+
+        assert_eq!(out.len(), 1, "fold emits exactly one chunk");
+        let metrics = out[0]
+            .data
+            .as_ref()
+            .expect("chunk data")
+            .llm_metrics
+            .as_ref()
+            .expect("llm_metrics must survive the fold");
+
+        // chunk_tokens drives `observe_response`; a zero here silently disables
+        // every token-derived frontend metric.
+        assert_eq!(
+            metrics.chunk_tokens, 5,
+            "chunk_tokens sums the folded chunks"
+        );
+        assert_eq!(metrics.output_tokens, 5);
+        assert_eq!(metrics.input_tokens, 7);
+    }
+
+    /// Chunks without metrics must not synthesize an all-zero annotation, which the
+    /// collector would treat as a real zero-token response.
+    #[tokio::test]
+    async fn test_fold_emits_no_metrics_when_chunks_have_none() {
+        let chunks = vec![create_mock_chunk("Hello".to_string(), 0)];
+        let (stream, _future) = fold_aggregate_with_future(stream::iter(chunks));
+        let out: Vec<_> = stream.collect().await;
+
+        assert_eq!(out.len(), 1);
+        assert!(out[0].data.as_ref().unwrap().llm_metrics.is_none());
     }
 }
