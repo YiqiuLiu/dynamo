@@ -1009,6 +1009,16 @@ impl ModelManager {
             .collect()
     }
 
+    /// A published card for a served model name, shared rather than cloned.
+    pub fn get_model_card_by_name(&self, model: &str) -> Option<Arc<ModelDeploymentCard>> {
+        self.catalog
+            .load()
+            .cards
+            .values()
+            .find(|card| card.display_name == model)
+            .cloned()
+    }
+
     /// Return owned keys for cards in the published catalog.
     pub fn get_model_card_keys(&self) -> Vec<String> {
         self.catalog.load().cards.keys().cloned().collect()

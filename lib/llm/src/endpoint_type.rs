@@ -30,6 +30,8 @@ pub enum EndpointType {
     Responses,
     /// Anthropic Messages API
     AnthropicMessages,
+    /// System One decision API, scored over the completions engine
+    SystemOne,
     /// Generate API (token-in/token-out)
     Generate,
     /// Batch API
@@ -51,6 +53,7 @@ impl EndpointType {
             Self::Rerank => "rerank",
             Self::Responses => "responses",
             Self::AnthropicMessages => "anthropic_messages",
+            Self::SystemOne => "systemone",
             Self::Generate => "generate",
             Self::Batch => "batch",
         }
@@ -70,6 +73,7 @@ impl EndpointType {
             Self::Rerank,
             Self::Responses,
             Self::AnthropicMessages,
+            Self::SystemOne,
             Self::Generate,
             Self::Batch,
         ]

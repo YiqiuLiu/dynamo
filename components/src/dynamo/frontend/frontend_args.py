@@ -93,6 +93,7 @@ class FrontendConfig(RouterConfigBase, KvRouterConfigBase, AisPerfConfigBase):
     chat_processor: str
     enable_anthropic_api: bool
     strip_anthropic_preamble: bool
+    enable_systemone_api: bool
     debug_perf: bool
     enable_streaming_tool_dispatch: bool
     enable_streaming_reasoning_dispatch: bool
@@ -557,6 +558,17 @@ class FrontendArgGroup(ArgGroup):
             help=(
                 "[EXPERIMENTAL] Enable Anthropic Messages API endpoint (/v1/messages). "
                 "This feature is experimental and may change."
+            ),
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--enable-systemone-api",
+            env_var="DYN_ENABLE_SYSTEMONE_API",
+            default=False,
+            help=(
+                "[EXPERIMENTAL] Enable the System One decision API endpoint "
+                "(/v1/systemone), which answers noul, choice and score questions "
+                "with label probabilities from one-token scored completions."
             ),
         )
         add_negatable_bool_argument(
