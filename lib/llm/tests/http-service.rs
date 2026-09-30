@@ -618,6 +618,7 @@ fn compute_index(endpoint: &Endpoint, request_type: &RequestType, status: &Statu
         Endpoint::Pooling => todo!(),
         Endpoint::Responses => todo!(),
         Endpoint::AnthropicMessages => todo!(),
+        Endpoint::SystemOne => todo!(),
         Endpoint::Tensor => todo!(),
         Endpoint::Images => todo!(),
         Endpoint::Videos => todo!(),

@@ -1109,7 +1109,7 @@ where
     Ok(request)
 }
 
-fn copy_context_metadata<T: Send + Sync + 'static, U: Send + Sync + 'static>(
+pub(super) fn copy_context_metadata<T: Send + Sync + 'static, U: Send + Sync + 'static>(
     source: &Context<T>,
     target: &mut Context<U>,
 ) {
@@ -2708,7 +2708,10 @@ fn failed_to_read_request_body_error() -> ErrorResponse {
 /// Reads and buffers a JSON request body.
 ///
 /// Validates the `Content-Type` before reading the body and limits buffering to [`get_body_limit`].
-async fn read_json_request_body(headers: &HeaderMap, body: Body) -> Result<Bytes, ErrorResponse> {
+pub(super) async fn read_json_request_body(
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Bytes, ErrorResponse> {
     ensure_json_content_type(headers)?;
     axum::body::to_bytes(body, get_body_limit())
         .await
@@ -3152,7 +3155,7 @@ pub(super) fn log_pre_commit_error(request_id: &str, error_response: &ErrorRespo
 }
 
 /// Render a typed unary aggregation failure through the standard semantic funnel.
-fn non_streaming_aggregation_error_response(
+pub(super) fn non_streaming_aggregation_error_response(
     error: DynamoError,
     fallback_message: &str,
 ) -> ErrorResponse {

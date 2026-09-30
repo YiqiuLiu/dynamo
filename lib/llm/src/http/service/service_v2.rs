@@ -472,6 +472,8 @@ impl StateFlags {
             EndpointType::AnthropicMessages => {
                 self.anthropic_endpoints_enabled.load(Ordering::Relaxed)
             }
+            // Served by the completions engine, so it is up whenever completions are.
+            EndpointType::SystemOne => self.cmpl_endpoints_enabled.load(Ordering::Relaxed),
             EndpointType::Generate => self.generate_endpoints_enabled.load(Ordering::Relaxed),
             EndpointType::Batch => self.batch_endpoints_enabled.load(Ordering::Relaxed),
         }
@@ -515,6 +517,7 @@ impl StateFlags {
             EndpointType::AnthropicMessages => self
                 .anthropic_endpoints_enabled
                 .store(enabled, Ordering::Relaxed),
+            EndpointType::SystemOne => {}
             EndpointType::Generate => self
                 .generate_endpoints_enabled
                 .store(enabled, Ordering::Relaxed),
@@ -1197,6 +1200,8 @@ static HTTP_SVC_FILES_PATH_ENV: &str = "DYN_HTTP_SVC_FILES_PATH";
 static HTTP_SVC_BATCHES_PATH_ENV: &str = "DYN_HTTP_SVC_BATCHES_PATH";
 /// Environment variable to set the anthropic messages endpoint path (default: `/v1/messages`)
 static HTTP_SVC_ANTHROPIC_PATH_ENV: &str = "DYN_HTTP_SVC_ANTHROPIC_PATH";
+/// Environment variable to set the System One endpoint path (default: `/v1/systemone`)
+static HTTP_SVC_SYSTEMONE_PATH_ENV: &str = "DYN_HTTP_SVC_SYSTEMONE_PATH";
 /// Environment variable to enable the experimental vLLM-compatible
 /// `/inference/v1/generate` endpoint. Truthy value opts in; disabled by default.
 pub(super) static VLLM_ENABLE_INFERENCE_V1_GENERATE_ENV: &str =
@@ -1263,6 +1268,7 @@ impl HttpServiceConfigBuilder {
         let model_ready_metrics_prefix = metrics_config.prefix();
         let frontend_api_config = config.frontend_api_config.clone();
         let anthropic_endpoints_enabled = frontend_api_config.anthropic().enabled();
+        let systemone_endpoints_enabled = frontend_api_config.systemone_enabled();
         let vllm_generate_enabled =
             config.enable_engine_apis || env_is_truthy(VLLM_ENABLE_INFERENCE_V1_GENERATE_ENV);
         let sglang_generate_enabled =
@@ -1433,6 +1439,7 @@ impl HttpServiceConfigBuilder {
             state.clone(),
             &config.request_template,
             anthropic_endpoints_enabled,
+            systemone_endpoints_enabled,
             vllm_generate_enabled,
             sglang_generate_enabled,
             config.enable_batch_endpoints,
@@ -1583,6 +1590,7 @@ impl HttpServiceConfigBuilder {
         state: Arc<State>,
         request_template: &Option<RequestTemplate>,
         enable_anthropic_endpoints: bool,
+        enable_systemone_endpoints: bool,
         vllm_generate_enabled: bool,
         sglang_generate_enabled: bool,
         enable_batch_endpoints: bool,
@@ -1646,6 +1654,15 @@ impl HttpServiceConfigBuilder {
                 EndpointType::AnthropicMessages,
                 (anthropic_docs, anthropic_route),
             );
+        }
+
+        if enable_systemone_endpoints {
+            tracing::warn!("System One decision API (/v1/systemone) is experimental.");
+            let (systemone_docs, systemone_route) = super::systemone::systemone_router(
+                state.clone(),
+                var(HTTP_SVC_SYSTEMONE_PATH_ENV).ok(),
+            );
+            endpoint_routes.insert(EndpointType::SystemOne, (systemone_docs, systemone_route));
         }
 
         if vllm_generate_enabled || sglang_generate_enabled {

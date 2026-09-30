@@ -3232,6 +3232,7 @@ class EntrypointArgs:
         enable_streaming_reasoning_dispatch: Optional[bool] = None,
         tokenizer_backend: Optional[str] = None,
         tokenizer_fallback: Optional[bool] = None,
+        enable_systemone_api: Optional[bool] = None,
     ) -> None:
         """
         Create EntrypointArgs.
@@ -3268,6 +3269,7 @@ class EntrypointArgs:
             enable_streaming_reasoning_dispatch: Optional streaming reasoning dispatch override
             tokenizer_backend: Optional tokenizer backend override ("default", "fastokens", or "basetenkenizer")
             tokenizer_fallback: Whether alternate tokenizer load failures fall back to HuggingFace
+            enable_systemone_api: Optional System One decision API (/v1/systemone) override
         """
         ...
 

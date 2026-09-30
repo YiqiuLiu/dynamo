@@ -432,6 +432,7 @@ async def async_main():
         "metrics_prefix": metrics_prefix,
         "enable_anthropic_api": config.enable_anthropic_api,
         "strip_anthropic_preamble": config.strip_anthropic_preamble,
+        "enable_systemone_api": config.enable_systemone_api,
         "enable_streaming_tool_dispatch": config.enable_streaming_tool_dispatch,
         "enable_streaming_reasoning_dispatch": config.enable_streaming_reasoning_dispatch,
         "reasoning_field_name": config.reasoning_field_name,

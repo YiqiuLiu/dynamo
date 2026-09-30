@@ -702,6 +702,9 @@ pub enum Endpoint {
     /// Anthropic Messages
     AnthropicMessages,
 
+    /// System One decisions
+    SystemOne,
+
     /// Tensor
     Tensor,
 
@@ -1859,6 +1862,7 @@ impl std::fmt::Display for Endpoint {
             Endpoint::Audios => write!(f, "audios"),
             Endpoint::Responses => write!(f, "responses"),
             Endpoint::AnthropicMessages => write!(f, "anthropic_messages"),
+            Endpoint::SystemOne => write!(f, "systemone"),
             Endpoint::Tensor => write!(f, "tensor"),
             Endpoint::Generate => write!(f, "generate"),
         }
@@ -1879,6 +1883,7 @@ impl Endpoint {
             Endpoint::Audios => "audios",
             Endpoint::Responses => "responses",
             Endpoint::AnthropicMessages => "anthropic_messages",
+            Endpoint::SystemOne => "systemone",
             Endpoint::Tensor => "tensor",
             Endpoint::Generate => "generate",
         }
